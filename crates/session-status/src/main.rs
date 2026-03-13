@@ -3,7 +3,7 @@ use std::env;
 use std::ffi::CString;
 use std::fs;
 use std::io::{self, BufRead, BufReader, Read, Write};
-use std::os::unix::process::parent_id;
+use std::os::unix::process::{parent_id, CommandExt};
 use std::path::{Path, PathBuf};
 use std::process::{self, Command, Stdio};
 use std::thread;
@@ -299,6 +299,14 @@ impl DaemonState {
             .and_then(|c| c.as_array())
             .unwrap_or(&empty_content);
 
+        // Check if this is an async agent launch (tool_result returned immediately
+        // but agent is still running in the background)
+        let is_async = v
+            .get("toolUseResult")
+            .and_then(|r| r.get("isAsync"))
+            .and_then(|a| a.as_bool())
+            .unwrap_or(false);
+
         // Check for tool_result blocks — may complete an agent
         let mut has_tool_result = false;
         let mut has_text = false;
@@ -307,8 +315,12 @@ impl DaemonState {
             match block_type {
                 "tool_result" => {
                     has_tool_result = true;
-                    if let Some(tool_use_id) = block.get("tool_use_id").and_then(|i| i.as_str()) {
-                        self.active_agents.remove(tool_use_id);
+                    if !is_async {
+                        if let Some(tool_use_id) =
+                            block.get("tool_use_id").and_then(|i| i.as_str())
+                        {
+                            self.active_agents.remove(tool_use_id);
+                        }
                     }
                 }
                 "text" => {
@@ -337,9 +349,15 @@ impl DaemonState {
         self.event = "user".to_string();
 
         if has_text && !has_tool_result {
-            // User text message (new prompt) — clears compacting, sets active
-            self.state = SessionState::Active;
-            self.activity = "thinking".to_string();
+            if self.state == SessionState::Compacting {
+                // During compaction, user text messages are the compacted context
+                // being replayed — don't clear compacting state
+                self.activity = "compacting".to_string();
+            } else {
+                // User text message (new prompt) — sets active
+                self.state = SessionState::Active;
+                self.activity = "thinking".to_string();
+            }
         }
         // tool_result-only messages don't change state (the assistant response will)
     }
@@ -396,7 +414,8 @@ impl DaemonState {
         }
     }
 
-    /// Detect if the last text content block in the message ends with '?'
+    /// Detect if the assistant is asking the user a question.
+    /// Checks the last paragraph of the last text block for a sentence ending with '?'.
     fn detect_question(&self, content: &[Value]) -> bool {
         for block in content.iter().rev() {
             let block_type = block.get("type").and_then(|t| t.as_str()).unwrap_or("");
@@ -405,7 +424,13 @@ impl DaemonState {
                 if text.is_empty() {
                     continue;
                 }
-                return text.trim_end().ends_with('?');
+                // Get the last paragraph (after the last blank line)
+                let last_paragraph = text
+                    .rsplit("\n\n")
+                    .next()
+                    .unwrap_or(text)
+                    .trim();
+                return last_paragraph.contains('?');
             }
         }
         false
@@ -493,6 +518,18 @@ fn hook_session_start(input: &Value) -> Result<(), String> {
     write_atomic(&cstatus, status.to_json().as_bytes())
         .map_err(|e| format!("write cstatus: {}", e))?;
 
+    // Check if a daemon is already running (e.g. session resume)
+    let cpid_path = transcript_sibling(transcript_path, "cpid");
+    if let Ok(pid_str) = fs::read_to_string(&cpid_path) {
+        if let Ok(daemon_pid) = pid_str.trim().parse::<u32>() {
+            if pid_is_alive(daemon_pid) {
+                // Daemon already running — just update .cstatus and notify
+                post_darwin_notification();
+                return Ok(());
+            }
+        }
+    }
+
     // Spawn daemon — clean up .cstatus if spawn fails
     let exe = env::current_exe().map_err(|e| {
         let _ = fs::remove_file(&cstatus);
@@ -513,6 +550,7 @@ fn hook_session_start(input: &Value) -> Result<(), String> {
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
+        .process_group(0) // New process group so hook runner can't kill daemon
         .spawn()
         .map_err(|e| {
             let _ = fs::remove_file(&cstatus);
@@ -535,9 +573,11 @@ fn hook_session_end(input: &Value) -> Result<(), String> {
 
     let cstatus = transcript_sibling(transcript_path, "cstatus");
     let csignal = transcript_sibling(transcript_path, "csignal");
+    let cpid = transcript_sibling(transcript_path, "cpid");
 
     let _ = fs::remove_file(&cstatus);
     let _ = fs::remove_file(&csignal);
+    let _ = fs::remove_file(&cpid);
 
     post_darwin_notification();
     Ok(())
@@ -612,6 +652,7 @@ fn daemon_mode(args: &[String]) -> Result<(), String> {
         cwd: get_arg(args, "--cwd")?,
         cstatus_path: transcript_sibling(&transcript_path, "cstatus"),
         csignal_path: transcript_sibling(&transcript_path, "csignal"),
+        cpid_path: transcript_sibling(&transcript_path, "cpid"),
     };
 
     // Read existing session_name if present
@@ -619,6 +660,9 @@ fn daemon_mode(args: &[String]) -> Result<(), String> {
 
     let mut state = DaemonState::new();
     state.session_name = session_name;
+
+    // Write daemon PID file so SessionStart can detect us on resume
+    let _ = write_atomic(&ctx.cpid_path, process::id().to_string().as_bytes());
 
     // Open transcript and process existing content
     let file = match fs::File::open(&transcript_path) {
@@ -731,6 +775,7 @@ struct SessionContext {
     cwd: String,
     cstatus_path: PathBuf,
     csignal_path: PathBuf,
+    cpid_path: PathBuf,
 }
 
 fn write_status(ctx: &SessionContext, state: &DaemonState) {
@@ -758,6 +803,7 @@ fn read_session_name(cstatus_path: &Path) -> Option<String> {
 fn cleanup_and_exit(ctx: &SessionContext) {
     let _ = fs::remove_file(&ctx.cstatus_path);
     let _ = fs::remove_file(&ctx.csignal_path);
+    let _ = fs::remove_file(&ctx.cpid_path);
     post_darwin_notification();
 }
 
@@ -873,6 +919,26 @@ mod tests {
         .to_string()
     }
 
+    fn make_async_tool_result(tool_use_id: &str) -> String {
+        serde_json::json!({
+            "type": "user",
+            "message": {
+                "content": [
+                    {"type": "tool_result", "tool_use_id": tool_use_id, "content": [
+                        {"type": "text", "text": "Async agent launched successfully."}
+                    ]}
+                ],
+                "role": "user"
+            },
+            "toolUseResult": {
+                "isAsync": true,
+                "status": "async_launched",
+                "agentId": "agent-abc123"
+            }
+        })
+        .to_string()
+    }
+
     fn make_user_text(text: &str) -> String {
         serde_json::json!({
             "type": "user",
@@ -976,6 +1042,37 @@ mod tests {
     }
 
     #[test]
+    fn question_in_last_paragraph_detected() {
+        let mut s = DaemonState::new();
+        s.process_line(&make_end_turn(
+            "I fixed the bug and deployed.\n\nDo you want me to also update the tests?",
+        ));
+        assert_eq!(s.state, SessionState::Waiting);
+        assert_eq!(s.activity, "question");
+    }
+
+    #[test]
+    fn question_mid_paragraph_last_paragraph_detected() {
+        let mut s = DaemonState::new();
+        // Question mark mid-sentence in the last paragraph, text continues after
+        s.process_line(&make_end_turn(
+            "Here's the summary.\n\nIs this what you wanted? Let me know and I can adjust.",
+        ));
+        assert_eq!(s.state, SessionState::Waiting);
+        assert_eq!(s.activity, "question");
+    }
+
+    #[test]
+    fn question_only_in_early_paragraph_not_detected() {
+        let mut s = DaemonState::new();
+        // Question is in an earlier paragraph, last paragraph is a statement
+        s.process_line(&make_end_turn(
+            "Do you want me to continue?\n\nI went ahead and fixed it anyway. Here's what I changed.",
+        ));
+        assert_eq!(s.state, SessionState::Idle);
+    }
+
+    #[test]
     fn end_turn_no_text_blocks_sets_idle() {
         let mut s = DaemonState::new();
         let line = serde_json::json!({
@@ -1068,6 +1165,32 @@ mod tests {
         assert!(s.active_agents.is_empty());
     }
 
+    #[test]
+    fn async_agent_not_removed_on_launch_result() {
+        let mut s = DaemonState::new();
+        s.process_line(&make_assistant_agent_spawn("toolu_agent1"));
+        assert_eq!(s.active_agents.len(), 1);
+        // Async tool_result should NOT remove the agent
+        s.process_line(&make_async_tool_result("toolu_agent1"));
+        assert_eq!(s.active_agents.len(), 1);
+        // end_turn with async agent still active should stay active
+        s.process_line(&make_end_turn("Agent is running in the background."));
+        assert_eq!(s.state, SessionState::Active);
+        assert_eq!(s.activity, "subagent");
+    }
+
+    #[test]
+    fn async_agent_removed_on_sync_completion() {
+        let mut s = DaemonState::new();
+        s.process_line(&make_assistant_agent_spawn("toolu_agent1"));
+        // Async launch — agent still tracked
+        s.process_line(&make_async_tool_result("toolu_agent1"));
+        assert_eq!(s.active_agents.len(), 1);
+        // Later, sync tool_result when agent completes
+        s.process_line(&make_tool_result("toolu_agent1"));
+        assert!(s.active_agents.is_empty());
+    }
+
     // -- Sticky compacting tests --
 
     #[test]
@@ -1096,9 +1219,24 @@ mod tests {
     }
 
     #[test]
-    fn compacting_clears_on_user_prompt() {
+    fn compacting_sticky_during_user_text() {
+        // User text messages during compaction are replayed context, not real prompts
         let mut s = DaemonState::new();
         s.process_line(&make_compact_boundary());
+        s.process_line(&make_user_text("This session is being continued..."));
+        assert_eq!(s.state, SessionState::Compacting);
+        assert_eq!(s.activity, "compacting");
+    }
+
+    #[test]
+    fn compacting_clears_after_end_turn_then_user_prompt() {
+        // After compaction finishes (end_turn → idle), a new user prompt works normally
+        let mut s = DaemonState::new();
+        s.process_line(&make_compact_boundary());
+        s.process_line(&make_user_text("compacted context"));
+        assert_eq!(s.state, SessionState::Compacting);
+        s.process_line(&make_end_turn("Compaction done."));
+        assert_eq!(s.state, SessionState::Idle);
         s.process_line(&make_user_text("next prompt"));
         assert_eq!(s.state, SessionState::Active);
         assert_eq!(s.activity, "thinking");
@@ -1334,6 +1472,12 @@ mod tests {
         assert_eq!(s.state, SessionState::Active);
 
         s.process_line(&make_compact_boundary());
+        assert_eq!(s.state, SessionState::Compacting);
+
+        // User text during compacting (replayed context) stays compacting
+        s.process_line(&make_user_text("This session is being continued..."));
+        assert_eq!(s.state, SessionState::Compacting);
+        s.process_line(&make_user_text("Previous conversation summary"));
         assert_eq!(s.state, SessionState::Compacting);
 
         // Tool use during compacting stays compacting
