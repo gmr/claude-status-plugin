@@ -19,12 +19,6 @@ cargo build --release -p session-status
 cargo test -p session-status
 ```
 
-After building, copy binaries to the plugin scripts directory:
-```bash
-cp target/release/session-status plugins/claude-status/scripts/
-cp target/release/set-session-name plugins/claude-status/scripts/
-```
-
 ## Repository Layout
 
 ```
