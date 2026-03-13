@@ -111,10 +111,38 @@ fn write_atomic(path: &Path, data: &[u8]) -> std::io::Result<()> {
     Ok(())
 }
 
+const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+fn print_help() {
+    eprintln!("set-session-name {VERSION}");
+    eprintln!("Set a custom display name for the current Claude Code session");
+    eprintln!();
+    eprintln!("USAGE:");
+    eprintln!("  set-session-name <session-name>");
+    eprintln!();
+    eprintln!("OPTIONS:");
+    eprintln!("  -h, --help       Print this help message");
+    eprintln!("  -V, --version    Print version");
+    eprintln!();
+    eprintln!("The session name is written to the .cstatus file for the current session,");
+    eprintln!("identified by walking the process tree from CLAUDE_PID (or parent PID).");
+}
+
 fn run() -> Result<(), String> {
     let args: Vec<String> = env::args().collect();
+
+    if args.iter().any(|a| a == "--help" || a == "-h") {
+        print_help();
+        return Ok(());
+    }
+    if args.iter().any(|a| a == "--version" || a == "-V") {
+        eprintln!("set-session-name {VERSION}");
+        return Ok(());
+    }
+
     if args.len() < 2 || args[1].is_empty() {
-        return Err("Usage: set-session-name <session-name>".to_string());
+        print_help();
+        return Err("missing required argument: <session-name>".to_string());
     }
     let session_name = &args[1];
 

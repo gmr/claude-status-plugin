@@ -2,7 +2,7 @@ use std::collections::HashSet;
 use std::env;
 use std::ffi::CString;
 use std::fs;
-use std::io::{self, BufRead, BufReader, Read, Write};
+use std::io::{self, BufRead, BufReader, Write};
 use std::os::unix::process::{parent_id, CommandExt};
 use std::path::{Path, PathBuf};
 use std::process::{self, Command, Stdio};
@@ -170,6 +170,9 @@ struct DaemonState {
     event: String,
     active_agents: HashSet<String>,
     session_name: Option<String>,
+    /// Set when compact_boundary fires. Suppresses state changes from replayed
+    /// context (user messages, progress) until the next real assistant response.
+    compacting: bool,
 }
 
 impl DaemonState {
@@ -180,6 +183,7 @@ impl DaemonState {
             event: String::new(),
             active_agents: HashSet::new(),
             session_name: None,
+            compacting: false,
         }
     }
 
@@ -197,17 +201,50 @@ impl DaemonState {
 
         match line_type {
             "assistant" => self.process_assistant(&v),
-            "user" => self.process_user(&v),
-            "progress" => self.process_progress(&v),
+            "user" => {
+                if self.compacting {
+                    // Suppress replayed context during compaction
+                    self.event = "user".to_string();
+                } else {
+                    self.process_user(&v);
+                }
+            }
+            "progress" => {
+                if self.compacting {
+                    self.event = "progress".to_string();
+                } else {
+                    self.process_progress(&v);
+                }
+            }
             "system" => self.process_system(&v),
             // No-op types: file-history-snapshot, last-prompt, pr-link, queue-operation
             _ => {}
+        }
+
+        // Compaction detection via agentId for long compactions that spawn
+        // a compact agent (agentId prefixed with "acompact-")
+        if !self.compacting && self.state != SessionState::Idle {
+            if let Some(agent_id) = v.get("agentId").and_then(|a| a.as_str()) {
+                if agent_id.starts_with("acompact-") {
+                    self.compacting = true;
+                    self.state = SessionState::Compacting;
+                    if !self.activity.is_empty() {
+                        self.activity = format!("compacting ({})", self.activity);
+                    } else {
+                        self.activity = "compacting".to_string();
+                    }
+                }
+            }
         }
 
         self.state != old_state || self.activity != old_activity
     }
 
     fn process_assistant(&mut self, v: &Value) {
+        // An assistant response after compaction means the replayed context is
+        // done and the model is responding to the post-compaction prompt.
+        self.compacting = false;
+
         let message = match v.get("message") {
             Some(m) => m,
             None => return,
@@ -243,7 +280,8 @@ impl DaemonState {
             "" => {
                 // stop_reason is null (streaming) — as_str() returns None, unwrap_or("")
                 if message.get("stop_reason").is_none_or(|s| s.is_null()) {
-                    self.set_state_with_sticky(SessionState::Active, String::new());
+                    self.state = SessionState::Active;
+                    self.activity = String::new();
                 }
             }
             "tool_use" => {
@@ -259,7 +297,8 @@ impl DaemonState {
                         }
                     })
                     .unwrap_or_default();
-                self.set_state_with_sticky(SessionState::Active, tool_name);
+                self.state = SessionState::Active;
+                self.activity = tool_name;
             }
             "end_turn" => {
                 if !self.active_agents.is_empty() {
@@ -282,7 +321,8 @@ impl DaemonState {
                 self.activity = String::new();
             }
             _ => {
-                self.set_state_with_sticky(SessionState::Active, String::new());
+                self.state = SessionState::Active;
+                    self.activity = String::new();
             }
         }
     }
@@ -349,15 +389,8 @@ impl DaemonState {
         self.event = "user".to_string();
 
         if has_text && !has_tool_result {
-            if self.state == SessionState::Compacting {
-                // During compaction, user text messages are the compacted context
-                // being replayed — don't clear compacting state
-                self.activity = "compacting".to_string();
-            } else {
-                // User text message (new prompt) — sets active
-                self.state = SessionState::Active;
-                self.activity = "thinking".to_string();
-            }
+            self.state = SessionState::Active;
+            self.activity = "thinking".to_string();
         }
         // tool_result-only messages don't change state (the assistant response will)
     }
@@ -373,13 +406,16 @@ impl DaemonState {
 
         match data_type {
             "agent_progress" => {
-                self.set_state_with_sticky(SessionState::Active, "subagent".to_string());
+                self.state = SessionState::Active;
+                self.activity = "subagent".to_string();
             }
             "bash_progress" => {
-                self.set_state_with_sticky(SessionState::Active, "bash".to_string());
+                self.state = SessionState::Active;
+                self.activity = "bash".to_string();
             }
             "mcp_progress" => {
-                self.set_state_with_sticky(SessionState::Active, "mcp".to_string());
+                self.state = SessionState::Active;
+                self.activity = "mcp".to_string();
             }
             // hook_progress, query_update, search_results_received, waiting_for_task — no change
             _ => {}
@@ -392,25 +428,11 @@ impl DaemonState {
         self.event = format!("system:{}", subtype);
 
         if subtype == "compact_boundary" {
+            // compact_boundary fires during compaction. Set compacting state
+            // and suppress replayed context until the next assistant response.
+            self.compacting = true;
             self.state = SessionState::Compacting;
-            self.activity = String::new();
-        }
-    }
-
-    /// Apply sticky compacting logic. If currently compacting and the new state
-    /// is active (from tool use / progress), preserve compacting with an augmented activity.
-    fn set_state_with_sticky(&mut self, new_state: SessionState, new_activity: String) {
-        if self.state == SessionState::Compacting && new_state == SessionState::Active {
-            // Stay compacting, augment activity
-            if new_activity.is_empty() {
-                self.activity = "compacting".to_string();
-            } else {
-                self.activity = format!("compacting ({})", new_activity);
-            }
-            // state stays Compacting
-        } else {
-            self.state = new_state;
-            self.activity = new_activity;
+            self.activity = "compacting".to_string();
         }
     }
 
@@ -460,12 +482,16 @@ impl DaemonState {
                 self.event = "elicitation_dialog".to_string();
             }
             "idle_prompt" => {
-                // For idle_prompt we don't have the message content from the signal.
-                // The daemon should have already processed the end_turn from JSONL,
-                // so just ensure we're idle (question detection already happened).
-                // If we're still active (e.g. agents finished between end_turn and signal),
-                // transition to idle.
-                if self.state == SessionState::Active && self.active_agents.is_empty() {
+                // idle_prompt means the session is waiting for user input.
+                // Transition to idle from active (if no agents) or compacting
+                // (post-compact replay finished without an assistant response).
+                let should_idle = match self.state {
+                    SessionState::Active => self.active_agents.is_empty(),
+                    SessionState::Compacting => true,
+                    _ => false,
+                };
+                if should_idle {
+                    self.compacting = false;
                     self.state = SessionState::Idle;
                     self.activity = String::new();
                     self.event = "idle_prompt".to_string();
@@ -819,8 +845,49 @@ fn get_arg(args: &[String], name: &str) -> Result<String, String> {
 // Main
 // ---------------------------------------------------------------------------
 
+const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+fn print_help() {
+    eprintln!("session-status {VERSION}");
+    eprintln!("Claude Status plugin hook daemon for the Claude Status macOS menu bar app");
+    eprintln!();
+    eprintln!("USAGE:");
+    eprintln!("  session-status              Hook mode (reads JSON from stdin, invoked by Claude Code)");
+    eprintln!("  session-status --signal     Signal mode (writes .csignal for running daemon)");
+    eprintln!("  session-status --daemon     Daemon mode (tails JSONL transcript, maintains state)");
+    eprintln!();
+    eprintln!("OPTIONS:");
+    eprintln!("  -h, --help       Print this help message");
+    eprintln!("  -V, --version    Print version");
+    eprintln!();
+    eprintln!("This binary is not intended to be run manually. It is invoked by Claude Code");
+    eprintln!("hooks registered in plugins/claude-status/hooks/hooks.json.");
+}
+
+fn read_stdin_json() -> Result<Value, String> {
+    let reader = BufReader::new(io::stdin().lock());
+    // Use streaming deserializer — returns as soon as a complete JSON value is
+    // parsed, without waiting for EOF on the pipe.
+    let mut stream = serde_json::Deserializer::from_reader(reader).into_iter::<Value>();
+    match stream.next() {
+        Some(Ok(value)) => Ok(value),
+        Some(Err(e)) => Err(format!("parse stdin: {}", e)),
+        None => Err("parse stdin: empty input".to_string()),
+    }
+}
+
 fn run() -> Result<(), String> {
     let args: Vec<String> = env::args().collect();
+
+    // Help / version
+    if args.iter().any(|a| a == "--help" || a == "-h") {
+        print_help();
+        return Ok(());
+    }
+    if args.iter().any(|a| a == "--version" || a == "-V") {
+        eprintln!("session-status {VERSION}");
+        return Ok(());
+    }
 
     // Daemon mode
     if args.iter().any(|a| a == "--daemon") {
@@ -829,23 +896,17 @@ fn run() -> Result<(), String> {
 
     // Signal mode
     if args.iter().any(|a| a == "--signal") {
-        let mut input_str = String::new();
-        io::stdin()
-            .read_to_string(&mut input_str)
-            .map_err(|e| format!("read stdin: {}", e))?;
-        let input: Value =
-            serde_json::from_str(&input_str).map_err(|e| format!("parse stdin: {}", e))?;
+        let input = read_stdin_json()?;
         return signal_mode(&input);
     }
 
-    // Hook mode — read stdin and dispatch by event
-    let mut input_str = String::new();
-    io::stdin()
-        .read_to_string(&mut input_str)
-        .map_err(|e| format!("read stdin: {}", e))?;
-    let input: Value =
-        serde_json::from_str(&input_str).map_err(|e| format!("parse stdin: {}", e))?;
+    // Hook mode — requires piped stdin
+    if atty::is(atty::Stream::Stdin) {
+        print_help();
+        return Err("no input provided (stdin is a terminal)".to_string());
+    }
 
+    let input = read_stdin_json()?;
     let hook_event = input
         .get("hook_event_name")
         .and_then(|s| s.as_str())
@@ -1191,63 +1252,119 @@ mod tests {
         assert!(s.active_agents.is_empty());
     }
 
-    // -- Sticky compacting tests --
+    // -- Compaction detection tests --
+    // compact_boundary fires during compaction. Replayed user/progress context
+    // is suppressed. The next assistant response clears the compacting flag.
+
+    fn make_compact_assistant_tool_use(tool_name: &str, tool_id: &str) -> String {
+        serde_json::json!({
+            "type": "assistant",
+            "agentId": "acompact-abc123",
+            "message": {
+                "content": [
+                    {"type": "tool_use", "name": tool_name, "id": tool_id, "input": {}}
+                ],
+                "stop_reason": "tool_use",
+                "type": "message",
+                "role": "assistant"
+            }
+        })
+        .to_string()
+    }
 
     #[test]
     fn compact_boundary_sets_compacting() {
         let mut s = DaemonState::new();
         s.process_line(&make_compact_boundary());
         assert_eq!(s.state, SessionState::Compacting);
+        assert_eq!(s.activity, "compacting");
+        assert!(s.compacting);
     }
 
     #[test]
-    fn compacting_sticky_during_tool_use() {
+    fn compact_boundary_suppresses_user_text() {
+        // After compact_boundary, replayed user messages should not change state
         let mut s = DaemonState::new();
         s.process_line(&make_compact_boundary());
-        s.process_line(&make_assistant_tool_use("Read", "toolu_1"));
         assert_eq!(s.state, SessionState::Compacting);
-        assert_eq!(s.activity, "compacting (Read)");
-    }
-
-    #[test]
-    fn compacting_sticky_during_progress() {
-        let mut s = DaemonState::new();
-        s.process_line(&make_compact_boundary());
-        s.process_line(&make_progress("bash_progress"));
-        assert_eq!(s.state, SessionState::Compacting);
-        assert_eq!(s.activity, "compacting (bash)");
-    }
-
-    #[test]
-    fn compacting_sticky_during_user_text() {
-        // User text messages during compaction are replayed context, not real prompts
-        let mut s = DaemonState::new();
-        s.process_line(&make_compact_boundary());
         s.process_line(&make_user_text("This session is being continued..."));
         assert_eq!(s.state, SessionState::Compacting);
-        assert_eq!(s.activity, "compacting");
+        s.process_line(&make_user_text("/compact"));
+        assert_eq!(s.state, SessionState::Compacting);
     }
 
     #[test]
-    fn compacting_clears_after_end_turn_then_user_prompt() {
-        // After compaction finishes (end_turn → idle), a new user prompt works normally
+    fn compact_boundary_suppresses_progress() {
         let mut s = DaemonState::new();
         s.process_line(&make_compact_boundary());
-        s.process_line(&make_user_text("compacted context"));
+        s.process_line(&make_progress("hook_progress"));
         assert_eq!(s.state, SessionState::Compacting);
-        s.process_line(&make_end_turn("Compaction done."));
-        assert_eq!(s.state, SessionState::Idle);
-        s.process_line(&make_user_text("next prompt"));
+    }
+
+    #[test]
+    fn compacting_clears_on_assistant_response() {
+        // The next assistant response after compaction means context replay is done
+        let mut s = DaemonState::new();
+        s.process_line(&make_compact_boundary());
+        s.process_line(&make_user_text("replayed context"));
+        assert_eq!(s.state, SessionState::Compacting);
+        s.process_line(&make_assistant_streaming());
         assert_eq!(s.state, SessionState::Active);
-        assert_eq!(s.activity, "thinking");
+        assert!(!s.compacting);
     }
 
     #[test]
     fn compacting_clears_on_end_turn() {
         let mut s = DaemonState::new();
         s.process_line(&make_compact_boundary());
-        s.process_line(&make_end_turn("Compaction done."));
+        s.process_line(&make_user_text("replayed context"));
+        s.process_line(&make_end_turn("Here's what we were working on."));
         assert_eq!(s.state, SessionState::Idle);
+        assert!(!s.compacting);
+    }
+
+    #[test]
+    fn user_prompt_after_compaction_works_normally() {
+        let mut s = DaemonState::new();
+        s.process_line(&make_compact_boundary());
+        s.process_line(&make_user_text("replayed context"));
+        s.process_line(&make_end_turn("Ready."));
+        assert_eq!(s.state, SessionState::Idle);
+        // Now a real user prompt should work
+        s.process_line(&make_user_text("next prompt"));
+        assert_eq!(s.state, SessionState::Active);
+        assert_eq!(s.activity, "thinking");
+    }
+
+    #[test]
+    fn acompact_agent_id_sets_compacting() {
+        // Long compactions spawn a compact agent with acompact- prefix
+        let mut s = DaemonState::new();
+        s.process_line(&make_compact_assistant_tool_use("Read", "toolu_1"));
+        assert_eq!(s.state, SessionState::Compacting);
+        assert_eq!(s.activity, "compacting (Read)");
+        assert!(s.compacting);
+    }
+
+    #[test]
+    fn non_compact_agent_id_stays_active() {
+        let mut s = DaemonState::new();
+        let line = serde_json::json!({
+            "type": "assistant",
+            "agentId": "a1234567",
+            "message": {
+                "content": [
+                    {"type": "tool_use", "name": "Bash", "id": "toolu_1", "input": {}}
+                ],
+                "stop_reason": "tool_use",
+                "type": "message",
+                "role": "assistant"
+            }
+        })
+        .to_string();
+        s.process_line(&line);
+        assert_eq!(s.state, SessionState::Active);
+        assert_eq!(s.activity, "Bash");
     }
 
     // -- Signal processing tests --
@@ -1277,6 +1394,17 @@ mod tests {
         let signal = serde_json::json!({"type": "idle_prompt"});
         assert!(s.process_signal(&signal));
         assert_eq!(s.state, SessionState::Idle);
+    }
+
+    #[test]
+    fn signal_idle_prompt_clears_compacting() {
+        let mut s = DaemonState::new();
+        s.compacting = true;
+        s.state = SessionState::Compacting;
+        let signal = serde_json::json!({"type": "idle_prompt"});
+        assert!(s.process_signal(&signal));
+        assert_eq!(s.state, SessionState::Idle);
+        assert!(!s.compacting);
     }
 
     #[test]
@@ -1465,38 +1593,58 @@ mod tests {
     }
 
     #[test]
-    fn realistic_compacting_sequence() {
+    fn realistic_manual_compact_sequence() {
+        // Manual /compact: compact_boundary, replayed context, then idle
         let mut s = DaemonState::new();
 
-        s.process_line(&make_user_text("Continue"));
+        s.process_line(&make_user_text("do something"));
         assert_eq!(s.state, SessionState::Active);
 
+        // compact_boundary fires
         s.process_line(&make_compact_boundary());
         assert_eq!(s.state, SessionState::Compacting);
 
-        // User text during compacting (replayed context) stays compacting
+        // Replayed context — suppressed
         s.process_line(&make_user_text("This session is being continued..."));
         assert_eq!(s.state, SessionState::Compacting);
-        s.process_line(&make_user_text("Previous conversation summary"));
+        s.process_line(&make_user_text("/compact"));
+        assert_eq!(s.state, SessionState::Compacting);
+        s.process_line(&make_progress("hook_progress"));
         assert_eq!(s.state, SessionState::Compacting);
 
-        // Tool use during compacting stays compacting
-        s.process_line(&make_assistant_tool_use("Bash", "toolu_1"));
-        assert_eq!(s.state, SessionState::Compacting);
-        assert_eq!(s.activity, "compacting (Bash)");
-
-        s.process_line(&make_tool_result("toolu_1"));
-
-        // Another tool
-        s.process_line(&make_assistant_tool_use("Read", "toolu_2"));
-        assert_eq!(s.state, SessionState::Compacting);
-        assert_eq!(s.activity, "compacting (Read)");
-
-        s.process_line(&make_tool_result("toolu_2"));
-
-        // End turn clears compacting
-        s.process_line(&make_end_turn("Done compacting."));
+        // Assistant responds post-compaction
+        s.process_line(&make_end_turn("Context compacted. Ready to continue."));
         assert_eq!(s.state, SessionState::Idle);
+        assert!(!s.compacting);
+
+        // Next user prompt works normally
+        s.process_line(&make_user_text("next prompt"));
+        assert_eq!(s.state, SessionState::Active);
+        assert_eq!(s.activity, "thinking");
+    }
+
+    #[test]
+    fn realistic_long_compact_with_agent() {
+        // Long compaction that spawns a compact agent (acompact- agentId)
+        let mut s = DaemonState::new();
+
+        // Compact agent tool use detected by agentId
+        s.process_line(&make_compact_assistant_tool_use("Read", "toolu_1"));
+        assert_eq!(s.state, SessionState::Compacting);
+        assert!(s.compacting);
+
+        // compact_boundary fires (stays compacting)
+        s.process_line(&make_compact_boundary());
+        assert_eq!(s.state, SessionState::Compacting);
+
+        // Replayed context — suppressed
+        s.process_line(&make_user_text("replayed summary"));
+        assert_eq!(s.state, SessionState::Compacting);
+
+        // Assistant responds
+        s.process_line(&make_end_turn("Done."));
+        assert_eq!(s.state, SessionState::Idle);
+        assert!(!s.compacting);
     }
 
     // -- Signal file integration --

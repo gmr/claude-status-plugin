@@ -19,6 +19,17 @@ cargo build --release -p session-status
 cargo test -p session-status
 ```
 
+## Deploy to Plugin Scripts
+
+After building, copy binaries and re-sign them (required to clear `com.apple.provenance` xattr that causes Gatekeeper kills):
+
+```bash
+cp target/release/session-status plugins/claude-status/scripts/session-status
+cp target/release/set-session-name plugins/claude-status/scripts/set-session-name
+codesign -fs - plugins/claude-status/scripts/session-status
+codesign -fs - plugins/claude-status/scripts/set-session-name
+```
+
 ## Repository Layout
 
 ```
@@ -82,7 +93,8 @@ The daemon reads JSONL lines and derives state. Key patterns:
 - `type:"user"` with text content → `active` / `"thinking"`
 - `type:"user"` with `tool_result` → removes agent from tracking set
 - `type:"progress"` → `active` with activity (subagent/bash/mcp)
-- `type:"system"` + `subtype:"compact_boundary"` → `compacting` (sticky)
+- `agentId` starting with `"acompact-"` → `compacting` (any event type)
+- `type:"system"` + `subtype:"compact_boundary"` → `idle` (compaction finished)
 
 ### Agent Tracking
 
