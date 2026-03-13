@@ -1,0 +1,3 @@
+[workspace]
+members = ["crates/session-status", "crates/set-session-name", "crates/jsonl-analyzer"]
+resolver = "2"
