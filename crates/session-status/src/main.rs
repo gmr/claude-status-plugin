@@ -497,6 +497,13 @@ impl DaemonState {
                     self.event = "idle_prompt".to_string();
                 }
             }
+            "pre_compact" => {
+                // PreCompact hook fires before compaction starts.
+                self.compacting = true;
+                self.state = SessionState::Compacting;
+                self.activity = "compacting".to_string();
+                self.event = "pre_compact".to_string();
+            }
             _ => {}
         }
 
@@ -648,6 +655,7 @@ fn signal_mode(input: &Value) -> Result<(), String> {
                 _ => serde_json::json!({"type": "idle_prompt"}),
             }
         }
+        "PreCompact" => serde_json::json!({"type": "pre_compact"}),
         _ => return Ok(()), // Unknown signal hook event — ignore
     };
 
@@ -1394,6 +1402,46 @@ mod tests {
         let signal = serde_json::json!({"type": "idle_prompt"});
         assert!(s.process_signal(&signal));
         assert_eq!(s.state, SessionState::Idle);
+    }
+
+    #[test]
+    fn signal_pre_compact_sets_compacting() {
+        let mut s = DaemonState::new();
+        s.state = SessionState::Active;
+        let signal = serde_json::json!({"type": "pre_compact"});
+        assert!(s.process_signal(&signal));
+        assert_eq!(s.state, SessionState::Compacting);
+        assert_eq!(s.activity, "compacting");
+        assert!(s.compacting);
+    }
+
+    #[test]
+    fn realistic_pre_compact_to_idle() {
+        // Full sequence: PreCompact signal → compaction → compact_boundary →
+        // replayed context → idle_prompt signal
+        let mut s = DaemonState::new();
+        s.state = SessionState::Active;
+
+        // PreCompact hook fires
+        let signal = serde_json::json!({"type": "pre_compact"});
+        s.process_signal(&signal);
+        assert_eq!(s.state, SessionState::Compacting);
+
+        // compact_boundary fires (compaction done, stays compacting to suppress replay)
+        s.process_line(&make_compact_boundary());
+        assert_eq!(s.state, SessionState::Compacting);
+
+        // Replayed context suppressed
+        s.process_line(&make_user_text("This session is being continued..."));
+        assert_eq!(s.state, SessionState::Compacting);
+        s.process_line(&make_progress("hook_progress"));
+        assert_eq!(s.state, SessionState::Compacting);
+
+        // idle_prompt signal clears to idle
+        let idle = serde_json::json!({"type": "idle_prompt"});
+        s.process_signal(&idle);
+        assert_eq!(s.state, SessionState::Idle);
+        assert!(!s.compacting);
     }
 
     #[test]
