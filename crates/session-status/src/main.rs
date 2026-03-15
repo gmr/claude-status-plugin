@@ -326,9 +326,13 @@ impl DaemonState {
                 self.state = SessionState::Idle;
                 self.activity = String::new();
             }
+            "max_tokens" => {
+                // Response hit token limit — turn is over, go idle
+                self.state = SessionState::Idle;
+                self.activity = String::new();
+            }
             _ => {
-                self.state = SessionState::Active;
-                    self.activity = String::new();
+                // Unknown stop_reason — don't change state
             }
         }
     }
@@ -438,12 +442,24 @@ impl DaemonState {
 
         self.event = format!("system:{}", subtype);
 
-        if subtype == "compact_boundary" {
-            // compact_boundary fires during compaction. Set compacting state
-            // and suppress replayed context until the next assistant response.
-            self.compacting = true;
-            self.state = SessionState::Compacting;
-            self.activity = "compacting".to_string();
+        match subtype {
+            "compact_boundary" => {
+                // compact_boundary fires during compaction. Set compacting state
+                // and suppress replayed context until the next assistant response.
+                self.compacting = true;
+                self.state = SessionState::Compacting;
+                self.activity = "compacting".to_string();
+            }
+            "turn_duration" => {
+                // turn_duration fires after a turn completes. If we're still
+                // in Active state (e.g. the final assistant message had
+                // stop_reason: null from streaming), transition to idle.
+                if self.state == SessionState::Active && self.active_agents.is_empty() {
+                    self.state = SessionState::Idle;
+                    self.activity = String::new();
+                }
+            }
+            _ => {}
         }
     }
 
@@ -674,7 +690,7 @@ fn signal_mode(input: &Value) -> Result<(), String> {
                 "permission_prompt" => serde_json::json!({"type": "permission_request"}),
                 "elicitation_dialog" => serde_json::json!({"type": "elicitation_dialog"}),
                 "idle_prompt" => serde_json::json!({"type": "idle_prompt"}),
-                _ => serde_json::json!({"type": "idle_prompt"}),
+                _ => return Ok(()), // Unknown notification type — ignore
             }
         }
         "PreCompact" => serde_json::json!({"type": "pre_compact"}),
@@ -1523,6 +1539,67 @@ mod tests {
         let signal = serde_json::json!({"type": "idle_prompt"});
         assert!(!s.process_signal(&signal));
         assert_eq!(s.state, SessionState::Active);
+    }
+
+    // -- turn_duration tests --
+
+    fn make_turn_duration() -> String {
+        serde_json::json!({
+            "type": "system",
+            "subtype": "turn_duration",
+            "isMeta": false
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn turn_duration_transitions_active_to_idle() {
+        let mut s = DaemonState::new();
+        // Simulate streaming response (stop_reason: null) leaving state Active
+        s.process_line(&make_assistant_streaming());
+        assert_eq!(s.state, SessionState::Active);
+        // turn_duration fires — should transition to idle
+        s.process_line(&make_turn_duration());
+        assert_eq!(s.state, SessionState::Idle);
+        assert_eq!(s.activity, "");
+    }
+
+    #[test]
+    fn turn_duration_no_change_when_agents_active() {
+        let mut s = DaemonState::new();
+        s.process_line(&make_assistant_agent_spawn("toolu_1"));
+        s.process_line(&make_assistant_streaming());
+        assert_eq!(s.state, SessionState::Active);
+        // turn_duration should NOT transition to idle when agents are tracked
+        s.process_line(&make_turn_duration());
+        assert_eq!(s.state, SessionState::Active);
+    }
+
+    #[test]
+    fn turn_duration_no_change_when_idle() {
+        let mut s = DaemonState::new();
+        assert_eq!(s.state, SessionState::Idle);
+        let changed = s.process_line(&make_turn_duration());
+        assert!(!changed);
+        assert_eq!(s.state, SessionState::Idle);
+    }
+
+    #[test]
+    fn max_tokens_transitions_to_idle() {
+        let mut s = DaemonState::new();
+        s.state = SessionState::Active;
+        let line = serde_json::json!({
+            "type": "assistant",
+            "message": {
+                "content": [{"type": "text", "text": "truncated response..."}],
+                "stop_reason": "max_tokens",
+                "type": "message",
+                "role": "assistant"
+            }
+        })
+        .to_string();
+        s.process_line(&line);
+        assert_eq!(s.state, SessionState::Idle);
     }
 
     // -- Partial line handling tests --
