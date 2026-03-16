@@ -404,6 +404,9 @@ impl DaemonState {
         let is_real_prompt = v.get("promptId").is_some_and(|p| !p.is_null());
 
         if has_text && !has_tool_result && is_real_prompt {
+            // A new user prompt means any pending agents from the previous
+            // turn were cancelled/interrupted — clear stale tracking.
+            self.active_agents.clear();
             self.state = SessionState::Active;
             self.activity = "thinking".to_string();
         }
@@ -451,10 +454,13 @@ impl DaemonState {
                 self.activity = "compacting".to_string();
             }
             "turn_duration" => {
-                // turn_duration fires after a turn completes. If we're still
-                // in Active state (e.g. the final assistant message had
-                // stop_reason: null from streaming), transition to idle.
-                if self.state == SessionState::Active && self.active_agents.is_empty() {
+                // turn_duration fires after a turn completes. Any agents
+                // still tracked are stale (e.g. user cancelled/interrupted).
+                self.active_agents.clear();
+                // If we're still in Active state (e.g. the final assistant
+                // message had stop_reason: null from streaming, or stale
+                // agents kept us active), transition to idle.
+                if self.state == SessionState::Active {
                     self.state = SessionState::Idle;
                     self.activity = String::new();
                 }
@@ -1107,6 +1113,20 @@ mod tests {
     }
 
     #[test]
+    fn user_prompt_clears_stale_agents() {
+        let mut s = DaemonState::new();
+        // Simulate an agent that was spawned but never completed
+        s.active_agents.insert("toolu_stale".to_string());
+        s.state = SessionState::Active;
+        s.activity = "subagent".to_string();
+        // User types a new prompt — the cancelled agent should be cleared
+        s.process_line(&make_user_text("continue"));
+        assert!(s.active_agents.is_empty());
+        assert_eq!(s.state, SessionState::Active);
+        assert_eq!(s.activity, "thinking");
+    }
+
+    #[test]
     fn meta_user_message_ignored() {
         let mut s = DaemonState::new();
         // isMeta messages (local command caveats) should not change state
@@ -1559,14 +1579,16 @@ mod tests {
     }
 
     #[test]
-    fn turn_duration_no_change_when_agents_active() {
+    fn turn_duration_clears_stale_agents() {
         let mut s = DaemonState::new();
         s.process_line(&make_assistant_agent_spawn("toolu_1"));
         s.process_line(&make_assistant_streaming());
         assert_eq!(s.state, SessionState::Active);
-        // turn_duration should NOT transition to idle when agents are tracked
+        assert!(!s.active_agents.is_empty());
+        // turn_duration should clear stale agents and transition to idle
         s.process_line(&make_turn_duration());
-        assert_eq!(s.state, SessionState::Active);
+        assert_eq!(s.state, SessionState::Idle);
+        assert!(s.active_agents.is_empty());
     }
 
     #[test]
