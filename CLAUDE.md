@@ -137,6 +137,16 @@ The daemon reads JSONL lines and derives state. Key patterns:
 
 Optional `session_name` field preserved across writes if present.
 
+## Releasing
+
+Before creating a release, you **MUST** update the version in all three locations:
+
+1. `plugins/claude-status/.claude-plugin/plugin.json` — the `"version"` field
+2. `.claude-plugin/marketplace.json` — the `"version"` field in the plugin entry
+3. `Cargo.toml` workspace members (if the Cargo version is being bumped)
+
+The `plugin.json` version is what Claude Code uses to determine the installed version. If it doesn't match the release tag, users will not get the correct version when installing via the marketplace.
+
 ## Platform
 
 - **macOS only** (Darwin notifications, libproc FFI)
