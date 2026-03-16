@@ -741,15 +741,9 @@ fn daemon_mode(args: &[String]) -> Result<(), String> {
     let file = match fs::File::open(&transcript_path) {
         Ok(f) => f,
         Err(_) => {
-            // Transcript doesn't exist yet — wait for it
-            let mut attempts = 0;
+            // Transcript doesn't exist yet — wait for it as long as the parent is alive
             loop {
                 thread::sleep(POLL_INTERVAL);
-                attempts += 1;
-                if attempts > 50 {
-                    // 5 seconds without transcript — give up
-                    return Err("transcript file never appeared".to_string());
-                }
                 if !pid_is_alive(pid) {
                     cleanup_and_exit(&ctx);
                     return Ok(());
